@@ -4,15 +4,23 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/rogpeppe/retry"
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/htmlindex"
 )
 
 func main() {
@@ -20,6 +28,8 @@ func main() {
 		log.Fatal(err)
 	}
 }
+
+var strategy = retry.Strategy{Delay: time.Second, MaxDelay: 5 * time.Second, MaxDuration: 30 * time.Second, Factor: 1.5}
 
 func Main() error {
 	flagTika := flag.String("tika", "http://localhost:9998", "Tika URL")
@@ -55,7 +65,7 @@ func Main() error {
 		return fmt.Errorf("%s: %w", iQry, err)
 	}
 
-	const qry = `SELECT id, folder||diskfile, file_type FROM mantis_bug_file_table A
+	const qry = `SELECT id, folder, diskfile, file_type FROM mantis_bug_file_table A
 		WHERE NOT EXISTS (SELECT 1 FROM mantis_plugin_attachment_search_table X WHERE X.file_id = A.id) AND
 		      file_type NOT LIKE 'image/%' AND file_type NOT LIKE 'video/%' AND file_type NOT LIKE 'application/x-executable%' AND
 		      file_type NOT IN ('application/x-java-archive')`
@@ -69,9 +79,12 @@ func Main() error {
 	enc := json.NewEncoder(&buf)
 	for rows.Next() {
 		var fileID int
-		var fn, typ string
-		if err = rows.Scan(&fileID, &fn, &typ); err != nil {
+		var folder, fn, typ string
+		if err = rows.Scan(&fileID, &folder, &fn, &typ); err != nil {
 			return fmt.Errorf("scan %s: %w", qry, err)
+		}
+		if folder != "" && strings.IndexByte(fn, '/') < 0 {
+			fn = filepath.Join(folder, fn)
 		}
 		typ, _, _ = strings.Cut(typ, ";")
 		res, err := tikaFile(ctx, *flagTika, fn, typ)
@@ -81,20 +94,27 @@ func Main() error {
 			// return fmt.Errorf("tikaFile(%q): %w", fn, err)
 		}
 		buf.Reset()
+		for k, v := range res.Meta {
+			if bytes.Contains(v, []byte("\\u0000")) {
+				res.Meta[k] = bytes.ReplaceAll(v, []byte("\\u0000"), nil)
+			}
+		}
 		if err = enc.Encode(res.Meta); err != nil {
 			return err
 		}
 		if len(res.Content) > 20<<20 {
 			res.Content = res.Content[:20<<20]
 		}
-		for length := 1048575; length > 1024; length /= 2 {
+		for length := 1048575; length > 16384; length /= 2 {
+			content = splitAt(content[:0], res.Content, length)
+			if len(content) > 100 {
+				break
+			}
 			tx, err := iConn.BeginTx(ctx, pgx.TxOptions{})
 			if err != nil {
 				return err
 			}
-			defer tx.Rollback(ctx)
-			if err := func() error {
-				content = splitAt(content[:0], res.Content, length)
+			if err = func() error {
 				for i, c := range content {
 					log.Println(fileID, i, len(c))
 					if _, err := iConn.Exec(ctx, "insQry", fileID, i, buf.Bytes(), c); err != nil {
@@ -108,6 +128,12 @@ func Main() error {
 				}
 				break
 			}
+			tx.Rollback(ctx)
+			var ec interface{ SQLState() string }
+			if errors.As(err, &ec) && ec.SQLState() == "22021" {
+				break
+			}
+			log.Printf("WARN %+v", err)
 		}
 	}
 	err = rows.Err()
@@ -115,28 +141,45 @@ func Main() error {
 	return err
 }
 
+var errRetry = errors.New("retry")
+
 func tikaFile(ctx context.Context, tikaURL, fn, typ string) (tikaResult, error) {
 	var result tikaResult
-	fh, err := os.Open(fn)
-	if err != nil {
-		return result, err
-	}
-	defer fh.Close()
-	req, err := http.NewRequestWithContext(ctx, "PUT", tikaURL+"/tika/text", fh)
-	if err != nil {
-		return result, err
-	}
-	req.Header.Set("Content-Type", typ)
-	resp, err := http.DefaultClient.Do(req)
-	fh.Close()
-	if err != nil {
-		return result, err
+
+	var resp *http.Response
+	for iter := strategy.Start(); ; {
+		if err := func() error {
+			fh, err := os.Open(fn)
+			if err != nil {
+				return err
+			}
+			defer fh.Close()
+			req, err := http.NewRequestWithContext(ctx, "PUT", tikaURL+"/tika/text", fh)
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Content-Type", typ)
+			req.GetBody = func() (io.ReadCloser, error) { return os.Open(fn) }
+			if resp, err = http.DefaultClient.Do(req); err == nil && resp.StatusCode != 503 {
+				return nil
+			}
+			log.Printf("WARN %v: %+v", req, err)
+			return fmt.Errorf("%w: %w", err, errRetry)
+		}(); err == nil {
+			break
+		} else if !errors.Is(err, errRetry) {
+			return result, err
+		} else if !iter.Next(ctx.Done()) {
+			log.Printf("ERROR: %+v", err)
+			return result, err
+		}
 	}
 	if resp.StatusCode >= 400 {
 		if resp.StatusCode == 422 {
 			if result.Meta == nil {
 				result.Meta = make(map[string]json.RawMessage, 1)
 			}
+			var err error
 			result.Meta["error"], err = json.Marshal(resp.Status)
 			return result, err
 		}
@@ -144,12 +187,30 @@ func tikaFile(ctx context.Context, tikaURL, fn, typ string) (tikaResult, error) 
 	}
 	defer resp.Body.Close()
 	var M map[string]json.RawMessage
-	if err = json.NewDecoder(resp.Body).Decode(&M); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&M); err != nil {
 		return result, err
 	}
-	err = json.Unmarshal(M["X-TIKA:content"], &result.Content)
+	err := json.Unmarshal(M["X-TIKA:content"], &result.Content)
 	delete(M, "X-TIKA:content")
 	result.Meta = M
+	if err != nil {
+		return result, err
+	}
+	if b := M["X-TIKA:detectedEncoding"]; len(b) != 0 {
+		var encName string
+		if json.Unmarshal(b, &encName) == nil && encName != "" {
+			if enc, err := htmlindex.Get(encName); err != nil {
+				log.Printf("get encoding %q: %+v", encName, err)
+			} else {
+				if result.Content, err = enc.NewDecoder().String(result.Content); err != nil {
+					log.Printf("decode from %q: %+v", encName, err)
+				}
+			}
+		}
+	}
+	if !utf8.Valid([]byte(result.Content)) {
+		result.Content, err = encoding.Replacement.NewEncoder().String(result.Content)
+	}
 	return result, err
 }
 
