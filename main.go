@@ -55,6 +55,7 @@ func Main() error {
 		"CREATE TABLE IF NOT EXISTS mantis_plugin_attachment_search_table (file_id INTEGER, seq SMALLINT, meta JSONB, content TEXT, tsvec TSVECTOR)",
 		"CREATE INDEX IF NOT EXISTS mantis_plugin_attachment_search_table_idx_file_id ON mantis_plugin_attachment_search_table(file_id)",
 		"CREATE INDEX IF NOT EXISTS mantis_plugin_attachment_search_table_idx_tsvec ON mantis_plugin_attachment_search_table USING GIN (tsvec)",
+		"GRANT SELECT ON mantis_plugin_attachment_search_table TO mantis,public",
 	} {
 		if _, err := iConn.Exec(ctx, qry); err != nil {
 			return fmt.Errorf("%s: %w", qry, err)
@@ -65,10 +66,15 @@ func Main() error {
 		return fmt.Errorf("%s: %w", iQry, err)
 	}
 
-	const qry = `SELECT id, folder, diskfile, file_type FROM mantis_bug_file_table A
+	const qry = `SELECT id, folder, diskfile, file_type FROM mantis_bug_file_table A TABLESAMPLE SYSTEM(10) 
 		WHERE NOT EXISTS (SELECT 1 FROM mantis_plugin_attachment_search_table X WHERE X.file_id = A.id) AND
 		      file_type NOT LIKE 'image/%' AND file_type NOT LIKE 'video/%' AND file_type NOT LIKE 'application/x-executable%' AND
-		      file_type NOT IN ('application/x-java-archive')`
+		      file_type NOT IN ('application/x-java-archive')
+	UNION
+	SELECT id, folder, diskfile, file_type FROM mantis_bug_file_table A
+		WHERE file_type NOT LIKE 'image/%' AND file_type NOT LIKE 'video/%' AND file_type NOT LIKE 'application/x-executable%' AND
+		      file_type NOT IN ('application/x-java-archive') AND
+		      A.id > COALESCE((SELECT MAX(file_id) FROM mantis_plugin_attachment_search_table), 0)`
 	rows, err := qConn.Query(ctx, qry)
 	if err != nil {
 		return fmt.Errorf("%s: %w", qry, err)
@@ -87,6 +93,9 @@ func Main() error {
 			fn = filepath.Join(folder, fn)
 		}
 		typ, _, _ = strings.Cut(typ, ";")
+		if pre, post, found := strings.Cut(typ, "/application/"); found {
+			typ = pre + "/" + post
+		}
 		res, err := tikaFile(ctx, *flagTika, fn, typ)
 		if err != nil {
 			log.Printf("tikaFile(%q, %q): %+v", fn, typ, err)
@@ -154,6 +163,15 @@ func tikaFile(ctx context.Context, tikaURL, fn, typ string) (tikaResult, error) 
 				return err
 			}
 			defer fh.Close()
+			if typ == "" {
+				var a [4096]byte
+				if n, _ := fh.Read(a[:]); n != 0 {
+					typ = http.DetectContentType(a[:n])
+				}
+				if _, err = fh.Seek(0, 0); err != nil {
+					return err
+				}
+			}
 			req, err := http.NewRequestWithContext(ctx, "PUT", tikaURL+"/tika/text", fh)
 			if err != nil {
 				return err
