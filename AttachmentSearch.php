@@ -77,6 +77,7 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS mw_tsvec AS
     FROM mantis_bugnote_text_table A
          INNER JOIN mantis_bugnote_table B ON B.bugnote_text_id = A.id 
 ",
+			"CREATE UNIQUE INDEX U_mw_tsvec ON mw_tsvec(bug_id, typ, id)", // kell a CONCURRENT REFRESH-hez
 			"GRANT SELECT ON mantis_plugin_attachment_search_table TO public",
 			"GRANT SELECT ON mw_tsvec TO public",
 		) as $t_qry ) {
