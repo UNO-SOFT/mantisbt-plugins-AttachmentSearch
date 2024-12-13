@@ -99,37 +99,37 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS mw_tsvec AS
 WITH query AS (SELECT websearch_to_tsquery('hungarian', " . db_param() . ") AS query)
 SELECT A.*, ts_headline('hungarian', A.document, query) AS headline
   FROM (
-SELECT A.bug_id AS bug_id, A.typ, A.id, ts_rank_cd(A.tsvec, query, 16) AS rank, 
+SELECT A.bug_id AS bug_id, A.typ, A.id, ROUND(ts_rank_cd(A.tsvec, query, 16)*100) AS rank, 
        B.summary AS document
   FROM mw_tsvec A INNER JOIN mantis_bug_table B ON B.id = A.id, query
   WHERE A.tsvec @@ query AND A.typ = 'Bs'
 UNION ALL
-SELECT A.bug_id, A.typ, A.id, ts_rank_cd(A.tsvec, query, 16) AS rank, 
+SELECT A.bug_id, A.typ, A.id, ROUND(ts_rank_cd(A.tsvec, query, 16)*100) AS rank, 
        B.description AS document
   FROM mw_tsvec A INNER JOIN mantis_bug_text_table B ON B.id = A.id, query
   WHERE A.tsvec @@ query AND A.typ = 'Td'
 UNION ALL
-SELECT A.bug_id, A.typ, A.id, ts_rank_cd(A.tsvec, query, 16) AS rank, 
+SELECT A.bug_id, A.typ, A.id, ROUND(ts_rank_cd(A.tsvec, query, 16)*100) AS rank, 
        B.additional_information AS document
   FROM mw_tsvec A INNER JOIN mantis_bug_text_table B ON B.id = A.id, query
   WHERE A.tsvec @@ query AND A.typ = 'Ta'
 UNION ALL
-SELECT A.bug_id, A.typ, A.id, ts_rank_cd(A.tsvec, query, 16) AS rank, 
+SELECT A.bug_id, A.typ, A.id, ROUND(ts_rank_cd(A.tsvec, query, 16)*100) AS rank, 
        B.steps_to_reproduce AS document
   FROM mw_tsvec A INNER JOIN mantis_bug_text_table B ON B.id = A.id, query
   WHERE A.tsvec @@ query AND A.typ = 'Ts'
 UNION ALL
-SELECT A.bug_id, A.typ, A.id, ts_rank_cd(A.tsvec, query, 16) AS rank, 
+SELECT A.bug_id, A.typ, A.id, ROUND(ts_rank_cd(A.tsvec, query, 16)*100) AS rank, 
        B.note AS document
   FROM mw_tsvec A INNER JOIN mantis_bugnote_text_table B ON B.id = A.id, query
   WHERE A.tsvec @@ query AND A.typ = 'N'
 UNION ALL
-SELECT B.bug_id, 'F' AS typ, A.file_id AS id, ts_rank_cd(A.tsvec, query, 16) AS rank, 
+SELECT B.bug_id, 'F' AS typ, A.file_id AS id, ROUND(ts_rank_cd(A.tsvec, query, 16)*100) AS rank, 
        A.content AS document
   FROM mantis_plugin_attachment_search_table A 
        INNER JOIN mantis_bug_file_table B ON B.id = A.file_id, query
   WHERE A.tsvec @@ query 
-  ORDER BY rank DESC 
+  ORDER BY rank DESC, bug_id DESC 
   LIMIT " . $p_limit . ") A, query";
 
 		$t_result = db_query( $t_qry, array( $p_query ) );
